@@ -9,6 +9,13 @@ import pandas as pd
 import yfinance as yf
 
 from dash import Dash, dcc, html, Input, Output
+INLINE = os.getenv("INLINE_DASH", "0") == "1"
+if INLINE:
+    try:
+        from jupyter_dash import JupyterDash
+        Dash = JupyterDash  # type: ignore[assignment]
+    except Exception:
+        pass
 import plotly.graph_objects as go
 
 # ----------------------------
@@ -52,9 +59,18 @@ def standardize(series_list: List[pd.Series], lookback: int, invert_flags: List[
     return out
 
 
-def safe_align(cols: Dict[str, pd.Series]) -> pd.DataFrame:
-    df = pd.concat(cols, axis=1).dropna(how="all")
-    return df.dropna()  # require full data for composites
+def safe_align(cols: Dict[str, pd.Series], min_required: int | None = None) -> pd.DataFrame:
+    df = pd.concat(cols, axis=1)
+    # drop rows that are entirely NA
+    df = df.dropna(how="all")
+    # drop columns that are entirely NA
+    df = df.dropna(axis=1, how="all")
+    if df.empty:
+        return df
+    if min_required is None:
+        # require ~60% of columns present per row
+        min_required = max(1, int(np.ceil(df.shape[1] * 0.6)))
+    return df.dropna(thresh=min_required)
 
 
 # ----------------------------
@@ -90,12 +106,16 @@ def get_market_frame(start: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cols_g: Dict[str, pd.Series] = {}
 
     # Base series
-    spy = fetch_first_working(["SPY"], start)
-    acwx = fetch_first_working(["ACWX"], start)
-    hyg = fetch_first_working(["HYG"], start)
-    ief = fetch_first_working(["IEF"], start)
+    spy = fetch_first_working(["SPY", "VOO", "IVV"], start)
+    acwx = fetch_first_working(["ACWX", "VEU", "VXUS", "ACWI"], start)
+    hyg = fetch_first_working(["HYG", "JNK"], start)
+    ief = fetch_first_working(["IEF", "GOVT", "IEI"], start)
     hg = fetch_first_working(["HG=F"], start)
     gc = fetch_first_working(["GC=F"], start)
+    if hg.empty or gc.empty:
+        # Fallback to ETFs if futures unavailable
+        hg = fetch_first_working(["CPER"], start)
+        gc = fetch_first_working(["GLD"], start)
     vix = fetch_first_working(["^VIX"], start)
 
     # Ratios
@@ -108,15 +128,13 @@ def get_market_frame(start: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cols_g["HG/GC"] = hg_gc
     cols_g["VIX_inv"] = vix  # we'll invert via z-score later
 
-    growth_df = safe_align(cols_g)
+    growth_df = safe_align(cols_g, min_required=3)
 
     # USD block
-    dxy = fetch_first_working(["DX-Y.NYB", "^DXY"], start)
-    if dxy.empty:
-        dxy = fetch_first_working(["UUP"], start)  # ETF fallback
+    dxy = fetch_first_working(["DX-Y.NYB", "^DXY", "UUP", "USDU"], start)
 
-    eurusd = fetch_first_working(["EURUSD=X"], start)
-    usdjpy = fetch_first_working(["JPY=X"], start)  # this is USD/JPY typically; name is confusing on yfinance
+    eurusd = fetch_first_working(["EURUSD=X", "FXE"], start)
+    usdjpy = fetch_first_working(["JPY=X", "USDJPY=X"], start)  # this is USD/JPY typically; name is confusing on yfinance
     # yfinance "JPY=X" = USDJPY (units JPY per USD). To get JPYUSD, invert.
     jpyusd = 1.0 / usdjpy if not usdjpy.empty else pd.Series(dtype=float)
 
@@ -125,7 +143,7 @@ def get_market_frame(start: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         "EURUSD_inv": eurusd,  # will invert in z-score stage
         "JPYUSD_inv": jpyusd,  # will invert in z-score stage (so ends up aligned with USD strength)
     }
-    usd_df = safe_align(cols_u)
+    usd_df = safe_align(cols_u, min_required=2)
 
     return growth_df, usd_df
 
@@ -161,15 +179,23 @@ def composite_scores(growth_df: pd.DataFrame,
         inv = ("inv" in c)  # invert the inverses so higher = stronger USD
         u_feats[c] = (-zscore(perf, z_lookback_days) if inv else zscore(perf, z_lookback_days)) * weights_usd.get(c, 1.0)
 
-    g_mat = pd.concat(g_feats, axis=1).dropna()
-    u_mat = pd.concat(u_feats, axis=1).dropna()
-    both = g_mat.join(u_mat, how="inner")
+    g_mat = pd.concat(g_feats, axis=1)
+    u_mat = pd.concat(u_feats, axis=1)
 
-    x = g_mat.sum(axis=1) / max(1e-9, sum(abs(weights_growth.get(c, 1.0)) for c in g_mat.columns))
-    y = u_mat.sum(axis=1) / max(1e-9, sum(abs(weights_usd.get(c, 1.0)) for c in u_mat.columns))
+    # Row-wise weighted means ignoring NaNs
+    wg = pd.Series({c: abs(weights_growth.get(c, 1.0)) for c in g_mat.columns})
+    wu = pd.Series({c: abs(weights_usd.get(c, 1.0)) for c in u_mat.columns})
 
+    denom_g = (~g_mat.isna()).multiply(wg, axis=1).sum(axis=1).replace(0, np.nan)
+    denom_u = (~u_mat.isna()).multiply(wu, axis=1).sum(axis=1).replace(0, np.nan)
+
+    x = g_mat.sum(axis=1) / denom_g
+    y = u_mat.sum(axis=1) / denom_u
+
+    x = x.dropna()
+    y = y.dropna()
     x, y = x.align(y, join="inner")
-    frame = pd.DataFrame({"GrowthX": x, "USDY": y})
+    frame = pd.DataFrame({"GrowthX": x, "USDY": y}).dropna()
     return x, y, frame
 
 
@@ -207,6 +233,7 @@ def classify_regime(x_now: float, y_now: float) -> str:
 # ----------------------------
 
 app = Dash(__name__)
+server = app.server
 app.title = "Interactive Dollar Smile"
 
 app.layout = html.Div([

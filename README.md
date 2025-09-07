@@ -24,5 +24,22 @@ python3 app.py
 Notes
 - yfinance uses liquid proxies; true macro series would need other APIs.
 - You can tweak lookbacks in the UI sliders.
+
+Can't open a local link?
+- Export an offline HTML snapshot (no server needed):
+```bash
+python3 export_snapshot.py --out output/dollar_smile.html
+```
+Open the generated `output/dollar_smile.html` in your IDE/file viewer.
+
+Deploy to a PaaS
+- This repo includes a `Procfile` and exposes `app:server` for `gunicorn`.
+- Any platform that runs `gunicorn` (Render, Railway, Fly.io, Heroku) will work.
+
+Run with Docker
+```bash
+docker build -t dollar-smile .
+docker run -p 8050:8050 dollar-smile
+```
 # Dollar-Smile
 Interactive Dollar Smile

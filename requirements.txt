@@ -5,3 +5,4 @@ pandas>=2.0.0
 numpy>=1.24.0
 gunicorn>=21.2.0
 jupyter-dash>=0.4.2
+kaleido>=0.2.1

@@ -113,18 +113,30 @@ def export_html(out_path: str, fig_smile: go.Figure, ts_g: go.Figure, ts_u: go.F
         f.write(html)
 
 
+def export_png(out_base: str, fig_smile: go.Figure, ts_g: go.Figure, ts_u: go.Figure) -> None:
+    # Requires kaleido
+    base, _ = os.path.splitext(out_base)
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    pio.write_image(fig_smile, base + "_smile.png", scale=2, width=1200, height=800)
+    pio.write_image(ts_g,     base + "_growth.png", scale=2, width=1200, height=500)
+    pio.write_image(ts_u,     base + "_usd.png",    scale=2, width=1200, height=500)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Export Dollar Smile snapshot to HTML")
     parser.add_argument("--lookback-years", type=int, default=6)
     parser.add_argument("--perf-days", type=int, default=63)
     parser.add_argument("--z-lookback", type=int, default=252)
     parser.add_argument("--out", type=str, default="/workspace/output/dollar_smile.html")
+    parser.add_argument("--png", action="store_true", help="Also export PNG images (requires kaleido)")
     parser.add_argument("--offline", action="store_true", help="Generate synthetic composites offline (no data downloads)")
     args = parser.parse_args(argv)
 
     fig_smile, ts_g, ts_u, regime_text = build_figures(args.lookback_years, args.perf_days, args.z_lookback, offline=args.offline)
     export_html(args.out, fig_smile, ts_g, ts_u, regime_text)
-    print(f"Wrote snapshot to: {args.out}\n{regime_text}")
+    if args.png:
+        export_png(args.out, fig_smile, ts_g, ts_u)
+    print(f"Wrote snapshot to: {args.out}{' and PNGs' if args.png else ''}\n{regime_text}")
     return 0
 
 

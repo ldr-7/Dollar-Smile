@@ -4,268 +4,203 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from scipy import stats
 
-# Page configuration
-st.set_page_config(
-    page_title="Dollar Smile Dashboard",
-    page_icon="📈",
-    layout="wide"
-)
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="MS Dollar Smile Tracker", layout="wide")
+st.title("💵 Live Morgan Stanley 'Dollar Smile' Tracker")
 
-st.title("📈 Morgan Stanley Dollar Smile Theory Dashboard")
-st.markdown("Visualizing the Dollar Smile theory using live market data")
+# --- 1. DATA FETCHING (Cached 5 min) ---
+@st.cache_data(ttl=300) 
+def fetch_smile_data():
+    """
+    Fetches live data for:
+    - USD Index (DX-Y.NYB) -> Y-Axis (USD Strength)
+    - SPY (US Stocks) & ACWX (Global ex-US) -> X-Axis Growth Proxy
+    - VIX -> X-Axis Fear Proxy
+    """
+    end_date = datetime.now()
+    # Fetch 2 years to ensure we have enough data for a 1-year rolling Z-score
+    start_date = end_date - timedelta(days=730) 
 
-# Sidebar for metrics
-st.sidebar.header("Current Metrics")
+    tickers = {
+        'USD': 'DX-Y.NYB',
+        'US_Eq': 'SPY',
+        'Global_Eq': 'ACWX',
+        'VIX': '^VIX'
+    }
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
-def fetch_market_data():
-    """Fetch live market data for DXY, SPY, ACWX, and VIX"""
     try:
-        # Fetch data for the last 90 days to calculate trailing metrics
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=90)
+        # Fetch data
+        raw_data = yf.download(list(tickers.values()), start=start_date, end=end_date, progress=False)
         
-        # Fetch tickers
-        dxy = yf.download("DX-Y.NYB", start=start_date, end=end_date, progress=False)
-        spy = yf.download("SPY", start=start_date, end=end_date, progress=False)
-        acwx = yf.download("ACWX", start=start_date, end=end_date, progress=False)
-        vix = yf.download("^VIX", start=start_date, end=end_date, progress=False)
-        
-        return {
-            'dxy': dxy,
-            'spy': spy,
-            'acwx': acwx,
-            'vix': vix
-        }
-    except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
-        return None
-
-def get_latest_value(df, column='Adj Close'):
-    """Get the latest non-null value from a dataframe"""
-    if df.empty:
-        return None
-    if column in df.columns:
-        series = df[column].dropna()
-    else:
-        series = df.dropna()
-    if series.empty:
-        return None
-    return series.iloc[-1]
-
-def calculate_zscore(series, window=60):
-    """Calculate rolling Z-score"""
-    if len(series) < window:
-        window = len(series)
-    if window < 2:
-        return pd.Series([0] * len(series), index=series.index)
-    
-    rolling_mean = series.rolling(window=window, min_periods=min(10, window//3)).mean()
-    rolling_std = series.rolling(window=window, min_periods=min(10, window//3)).std()
-    
-    # Avoid division by zero
-    rolling_std = rolling_std.replace(0, np.nan)
-    zscore = (series - rolling_mean) / rolling_std
-    return zscore.fillna(0)
-
-def calculate_smile_coordinates(dxy_data, spy_data, acwx_data, vix_data):
-    """Calculate X and Y coordinates for the Dollar Smile"""
-    
-    # Get adjusted close prices
-    dxy_close = dxy_data['Adj Close'] if 'Adj Close' in dxy_data.columns else dxy_data.iloc[:, -1]
-    spy_close = spy_data['Adj Close'] if 'Adj Close' in spy_data.columns else spy_data.iloc[:, -1]
-    acwx_close = acwx_data['Adj Close'] if 'Adj Close' in acwx_data.columns else acwx_data.iloc[:, -1]
-    vix_close = vix_data['Adj Close'] if 'Adj Close' in vix_data.columns else vix_data.iloc[:, -1]
-    
-    # Align all series by date
-    aligned = pd.DataFrame({
-        'DXY': dxy_close,
-        'SPY': spy_close,
-        'ACWX': acwx_close,
-        'VIX': vix_close
-    }).dropna()
-    
-    if len(aligned) < 10:
-        return None, None, None
-    
-    # Calculate SPY/ACWX ratio
-    growth_ratio = aligned['SPY'] / aligned['ACWX']
-    
-    # Calculate Z-scores
-    dxy_zscore = calculate_zscore(aligned['DXY'])
-    growth_ratio_zscore = calculate_zscore(growth_ratio)
-    
-    # Calculate X coordinate
-    # If VIX > 25, shift X to negative (Left Side/Fear)
-    x_coords = []
-    for idx, vix_val in enumerate(aligned['VIX']):
-        if pd.notna(vix_val) and vix_val > 25:
-            # Shift to negative (fear side)
-            x_coords.append(-abs(growth_ratio_zscore.iloc[idx]))
+        # Handle yfinance structure (Access 'Close' price)
+        if 'Close' in raw_data.columns:
+            data = raw_data['Close']
         else:
-            x_coords.append(growth_ratio_zscore.iloc[idx])
-    
-    x_coords = pd.Series(x_coords, index=aligned.index)
-    
-    # Y coordinate is Z-score of DXY
-    y_coords = dxy_zscore
-    
-    # Create result dataframe
-    result_df = pd.DataFrame({
-        'Date': aligned.index,
-        'X': x_coords,
-        'Y': y_coords,
-        'VIX': aligned['VIX'],
-        'DXY': aligned['DXY'],
-        'Growth_Ratio': growth_ratio
-    })
-    
-    return result_df, aligned['VIX'].iloc[-1], aligned['DXY'].iloc[-1], growth_ratio.iloc[-1]
+            data = raw_data
 
-def create_smile_plot(df, current_vix, current_dxy, current_growth_ratio):
-    """Create the Dollar Smile visualization"""
+        # Flatten MultiIndex columns if necessary
+        if isinstance(data.columns, pd.MultiIndex):
+            # Map ticker symbols to friendly names
+            # Note: yfinance might return column names as the Ticker string
+            data.columns = [col[0] if isinstance(col, tuple) else col for col in data.columns]
+
+        # Rename columns to friendly names
+        # Invert the dictionary to map Symbol -> Friendly Name
+        inv_map = {v: k for k, v in tickers.items()}
+        data = data.rename(columns=inv_map)
+        
+        # Ensure all required columns exist (handling potential API failures for specific tickers)
+        required = ['USD', 'US_Eq', 'Global_Eq', 'VIX']
+        if not all(col in data.columns for col in required):
+            st.error("Missing data columns from API. Please try again later.")
+            return pd.DataFrame()
+
+        return data.dropna()
+    except Exception as e:
+        st.error(f"Failed to fetch data: {e}")
+        return pd.DataFrame()
+
+df = fetch_smile_data()
+
+if df.empty:
+    st.stop()
+
+# --- 2. CALCULATIONS ---
+
+# Rolling window for Z-Scores (1 year / 252 trading days)
+window = 252
+
+# A. Y-Axis: USD Strength (Z-Score)
+# We compare current USD price to its 1-year average
+df['USD_Mean'] = df['USD'].rolling(window).mean()
+df['USD_Std'] = df['USD'].rolling(window).std()
+df['Y_Coord'] = (df['USD'] - df['USD_Mean']) / df['USD_Std']
+
+# B. X-Axis: Economic Conditions
+# Step 1: Calculate Relative Growth (US vs Global)
+df['Rel_Growth'] = df['US_Eq'] / df['Global_Eq']
+df['Growth_Mean'] = df['Rel_Growth'].rolling(window).mean()
+df['Growth_Std'] = df['Rel_Growth'].rolling(window).std()
+df['Growth_Z'] = (df['Rel_Growth'] - df['Growth_Mean']) / df['Growth_Std']
+
+# Step 2: Determine Active X-Coordinate based on Regime
+def get_smile_x(row):
+    # FEAR REGIME (Left Side)
+    # If VIX is high (>25), logic shifts to "Safety".
+    # We ignore growth metrics and force the X coordinate negative.
+    if row['VIX'] > 25:
+        # Calculate how severe the fear is
+        severity = (row['VIX'] - 25) / 5
+        # Cap the shift so it doesn't go off chart, but ensure it's on the left (< -1)
+        return -1.5 - severity 
     
-    if df is None or len(df) < 2:
-        st.error("Insufficient data to create visualization")
-        return None
+    # NORMAL/GROWTH REGIME (Middle to Right)
+    # Follow the US vs Global growth ratio Z-score
+    return row['Growth_Z']
+
+df['X_Coord'] = df.apply(get_smile_x, axis=1)
+
+# Get most recent data points
+current = df.iloc[-1]
+prev_week = df.iloc[-5] if len(df) > 5 else df.iloc[0]
+
+# --- 3. DASHBOARD LAYOUT ---
+
+# Create two columns: Main Chart (Left) and Metrics Sidebar (Right)
+col_chart, col_metrics = st.columns([3, 1])
+
+with col_metrics:
+    st.subheader("Current Metrics")
     
-    # Get last 60 days for trail
-    df_trail = df.tail(60).copy()
-    current_point = df.iloc[-1]
+    # METRIC 1: Regime Classification
+    regime = "Unknown"
+    regime_color = "gray"
+    if current['VIX'] > 25:
+        regime = "FEAR / RISK OFF"
+        regime_color = "red"
+        st.error(f"⚠️ {regime}")
+        st.caption("Dollar strengthening due to safety seeking.")
+    elif current['X_Coord'] > 0.5:
+        regime = "US EXCEPTIONALISM"
+        regime_color = "green"
+        st.success(f"🇺🇸 {regime}")
+        st.caption("Dollar strengthening due to US growth.")
+    else:
+        regime = "GLOBAL SYNC / MUDDLING"
+        regime_color = "orange"
+        st.warning(f"⚖️ {regime}")
+        st.caption("Dollar weakening as capital flows global.")
+
+    st.divider()
+
+    # METRIC 2: Data Points
+    st.metric("VIX (Fear)", f"{current['VIX']:.2f}", delta=f"{current['VIX'] - prev_week['VIX']:.2f}", delta_color="inverse")
+    st.metric("DXY (USD Index)", f"{current['USD']:.2f}", delta=f"{current['USD'] - prev_week['USD']:.2f}")
+    st.metric("US/Global Ratio", f"{current['Rel_Growth']:.3f}", delta=f"{current['Growth_Z']:.2f} σ")
     
-    # Create static parabola background (theoretical smile)
-    # Parabola: y = a*x^2 + b, where a > 0 creates a smile
-    x_range = np.linspace(df['X'].min() - 0.5, df['X'].max() + 0.5, 200)
-    # Standard smile: y = x^2 (shifted and scaled to fit data)
-    # Adjust parabola to fit the data range
-    x_center = (df['X'].min() + df['X'].max()) / 2
-    y_min = df['Y'].min()
-    y_max = df['Y'].max()
-    
-    # Create a smile curve: y = a*(x - x_center)^2 + y_offset
-    # Scale to fit the data
-    a = 0.3  # Curvature parameter
-    y_offset = (y_min + y_max) / 2
-    y_smile = a * (x_range - x_center)**2 + y_offset
-    
-    # Create figure
+    st.divider()
+    st.caption(f"Active Coordinates:\nX: {current['X_Coord']:.2f} | Y: {current['Y_Coord']:.2f}")
+
+
+with col_chart:
+    # --- VISUALIZATION ---
     fig = go.Figure()
+
+    # 1. Theoretical Smile Curve (Background)
+    x_theory = np.linspace(-4, 4, 100)
+    # Parabola: y = x^2 (roughly normalized)
+    y_theory = 0.5 * (x_theory**2) - 1.0 
     
-    # Add theoretical smile curve (parabola)
     fig.add_trace(go.Scatter(
-        x=x_range,
-        y=y_smile,
+        x=x_theory, y=y_theory,
         mode='lines',
         name='Theoretical Smile',
-        line=dict(color='gray', width=2, dash='dash'),
-        opacity=0.7
+        line=dict(color='lightgrey', dash='dash'),
+        hoverinfo='skip'
     ))
-    
-    # Add trail of last 60 days
+
+    # 2. Historical Trail (Last 60 Days)
+    trail_df = df.tail(60)
     fig.add_trace(go.Scatter(
-        x=df_trail['X'],
-        y=df_trail['Y'],
+        x=trail_df['X_Coord'],
+        y=trail_df['Y_Coord'],
         mode='lines+markers',
-        name='60-Day Trail',
-        line=dict(color='blue', width=1),
-        marker=dict(size=4, color='blue', opacity=0.6),
-        hovertemplate='Date: %{text}<br>X: %{x:.3f}<br>Y: %{y:.3f}<extra></extra>',
-        text=df_trail['Date'].dt.strftime('%Y-%m-%d')
+        name='Last 60 Days',
+        marker=dict(size=4, opacity=0.5, color='gray'),
+        line=dict(width=1, color='gray'),
+        text=trail_df.index.strftime('%Y-%m-%d'),
+        hovertemplate='<b>Date</b>: %{text}<br><b>X</b>: %{x:.2f}<br><b>Y</b>: %{y:.2f}'
     ))
-    
-    # Add current position (highlighted)
+
+    # 3. Current Position (Red Diamond)
     fig.add_trace(go.Scatter(
-        x=[current_point['X']],
-        y=[current_point['Y']],
+        x=[current['X_Coord']],
+        y=[current['Y_Coord']],
         mode='markers+text',
-        name='Current Position',
-        marker=dict(size=20, color='red', symbol='diamond'),
-        text=['Current'],
-        textposition='top center',
-        hovertemplate=f'Date: {current_point["Date"].strftime("%Y-%m-%d")}<br>X: {current_point["X"]:.3f}<br>Y: {current_point["Y"]:.3f}<br>VIX: {current_point["VIX"]:.2f}<br>DXY: {current_point["DXY"]:.2f}<extra></extra>'
+        name='CURRENT',
+        marker=dict(size=18, color='red', symbol='diamond', line=dict(width=2, color='black')),
+        text=["📍 YOU ARE HERE"],
+        textposition="top center"
     ))
-    
-    # Update layout
+
+    # Annotations for the "Smile" Zones
+    fig.add_annotation(x=-3, y=3, text="Recession / Fear<br>(Strong USD)", showarrow=False, font=dict(color="red", size=12))
+    fig.add_annotation(x=3, y=3, text="US Stronger Growth<br>(Strong USD)", showarrow=False, font=dict(color="green", size=12))
+    fig.add_annotation(x=0, y=-2, text="Global Sync Growth<br>(Weak USD)", showarrow=False, font=dict(color="orange", size=12))
+
     fig.update_layout(
-        title='Dollar Smile Visualization',
-        xaxis_title='Smile X-Coordinate (Growth/Risk Sentiment)',
-        yaxis_title='Smile Y-Coordinate (USD Strength - DXY Z-score)',
-        hovermode='closest',
-        template='plotly_white',
+        title="Active Dollar Smile Positioning",
+        xaxis_title="<-- Risk Aversion (VIX) | US vs Global Growth (Rel. Strength) -->",
+        yaxis_title="USD Strength (Z-Score)",
         height=600,
-        legend=dict(
-            yanchor="top",
-            y=0.99,
-            xanchor="left",
-            x=0.01
-        )
+        showlegend=False,
+        xaxis=dict(range=[-4, 4], zeroline=True), 
+        yaxis=dict(range=[-3, 4], zeroline=True)
     )
-    
-    # Add grid
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
-    
-    # Add zero lines
-    fig.add_hline(y=0, line_dash="dot", line_color="black", opacity=0.3)
-    fig.add_vline(x=0, line_dash="dot", line_color="black", opacity=0.3)
-    
-    return fig
 
-# Main app logic
-data = fetch_market_data()
+    st.plotly_chart(fig, use_container_width=True)
 
-if data is not None:
-    # Calculate coordinates
-    result_df, current_vix, current_dxy, current_growth_ratio = calculate_smile_coordinates(
-        data['dxy'], data['spy'], data['acwx'], data['vix']
-    )
-    
-    if result_df is not None:
-        # Display metrics in sidebar
-        st.sidebar.metric("VIX", f"{current_vix:.2f}")
-        st.sidebar.metric("USD Level (DXY)", f"{current_dxy:.2f}")
-        st.sidebar.metric("Growth Ratio (SPY/ACWX)", f"{current_growth_ratio:.4f}")
-        
-        # Display current coordinates
-        current_x = result_df.iloc[-1]['X']
-        current_y = result_df.iloc[-1]['Y']
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("Current Position")
-        st.sidebar.metric("X-Coordinate", f"{current_x:.3f}")
-        st.sidebar.metric("Y-Coordinate", f"{current_y:.3f}")
-        
-        # Determine regime
-        if current_vix > 25:
-            regime = "Left Side (Fear)"
-            st.sidebar.warning(f"⚠️ {regime}")
-        elif current_x > 0.5 and current_y > 0.3:
-            regime = "Right Side (US Exceptionalism)"
-            st.sidebar.success(f"✅ {regime}")
-        elif current_x < -0.2 and current_y > 0.3:
-            regime = "Left Side (Crisis USD Bid)"
-            st.sidebar.error(f"🔴 {regime}")
-        else:
-            regime = "Transitional/Mixed"
-            st.sidebar.info(f"ℹ️ {regime}")
-        
-        # Create and display plot
-        fig = create_smile_plot(result_df, current_vix, current_dxy, current_growth_ratio)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Display data table (optional, collapsible)
-        with st.expander("View Historical Data"):
-            st.dataframe(
-                result_df[['Date', 'X', 'Y', 'VIX', 'DXY', 'Growth_Ratio']].tail(30),
-                use_container_width=True
-            )
-    else:
-        st.error("Could not calculate coordinates. Please check data availability.")
-else:
-    st.error("Failed to fetch market data. Please try again later.")
-
-# Footer
-st.markdown("---")
-st.markdown("**Data Source:** Yahoo Finance via yfinance | **Last Updated:** " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+# --- 4. DATA TABLE ---
+with st.expander("📊 View Historical Data Table"):
+    st.dataframe(df[['USD', 'US_Eq', 'Global_Eq', 'VIX', 'X_Coord', 'Y_Coord']].sort_index(ascending=False))

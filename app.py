@@ -1,361 +1,271 @@
-from __future__ import annotations
-import os
-import datetime as dt
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
+import streamlit as st
 import yfinance as yf
-
-from dash import Dash, dcc, html, Input, Output
-INLINE = os.getenv("INLINE_DASH", "0") == "1"
-if INLINE:
-    try:
-        from jupyter_dash import JupyterDash
-        Dash = JupyterDash  # type: ignore[assignment]
-    except Exception:
-        pass
+import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
+from scipy import stats
 
-# ----------------------------
-# Utilities
-# ----------------------------
-
-@dataclass
-class TickerSpec:
-    label: str
-    tickers: List[str]
-    invert: bool = False  # use for FX where we want USD strength (e.g., EURUSD inverted)
-
-
-def fetch_first_working(tickers: List[str], start: str) -> pd.Series:
-    """Try a list of tickers until one works; return Adj Close series."""
-    for t in tickers:
-        try:
-            df = yf.download(t, start=start, progress=False)["Adj Close"].dropna()
-            if df.size:
-                df.name = t
-                return df
-        except Exception:
-            pass
-    return pd.Series(dtype=float)
-
-
-def pct_change_period(s: pd.Series, days: int) -> pd.Series:
-    return s.pct_change(days)
-
-
-def zscore(s: pd.Series, lookback: int) -> pd.Series:
-    roll = s.rolling(lookback, min_periods=max(10, lookback // 5))
-    return (s - roll.mean()) / (roll.std(ddof=0) + 1e-9)
-
-
-def standardize(series_list: List[pd.Series], lookback: int, invert_flags: List[bool]) -> List[pd.Series]:
-    out = []
-    for s, inv in zip(series_list, invert_flags):
-        zs = zscore(s, lookback)
-        out.append(-zs if inv else zs)
-    return out
-
-
-def safe_align(cols: Dict[str, pd.Series], min_required: int | None = None) -> pd.DataFrame:
-    df = pd.concat(cols, axis=1)
-    # drop rows that are entirely NA
-    df = df.dropna(how="all")
-    # drop columns that are entirely NA
-    df = df.dropna(axis=1, how="all")
-    if df.empty:
-        return df
-    if min_required is None:
-        # require ~60% of columns present per row
-        min_required = max(1, int(np.ceil(df.shape[1] * 0.6)))
-    return df.dropna(thresh=min_required)
-
-
-# ----------------------------
-# Data plumbing
-# ----------------------------
-
-START_DEFAULT = (dt.date.today() - dt.timedelta(days=365 * 6)).strftime("%Y-%m-%d")
-
-GROWTH_SPECS: List[TickerSpec] = [
-    TickerSpec("US Equities (SPY)", ["SPY"]),
-    TickerSpec("Global ex-US (ACWX)", ["ACWX"]),
-    TickerSpec("Credit vs UST (HYG/IEF)", ["HYG"], invert=False),  # we'll divide by IEF later
-    TickerSpec("Copper/Gold (HG/GC)", ["HG=F"], invert=False),     # will divide by GC later
-    TickerSpec("Volatility (VIX) — inverted", ["^VIX"], invert=True),
-]
-
-USD_SPECS: List[TickerSpec] = [
-    TickerSpec("DXY (or fallback UUP)", ["DX-Y.NYB", "^DXY", "UUP"]),
-    TickerSpec("EURUSD (invert)", ["EURUSD=X"], invert=True),
-    TickerSpec("JPYUSD (invert; use USDJPY and invert appropriately)", ["JPY=X"], invert=False),
-]
-
-# Special cases we build from pairs
-PAIR_HELPERS = {
-    "HYG/IEF": ("HYG", "IEF"),
-    "HG/GC": ("HG=F", "GC=F"),
-    "USDJPY to JPYUSD": ("USDJPY=X",),  # if needed
-}
-
-
-def get_market_frame(start: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (growth_df, usd_df) daily levels for each component."""
-    cols_g: Dict[str, pd.Series] = {}
-
-    # Base series
-    spy = fetch_first_working(["SPY", "VOO", "IVV"], start)
-    acwx = fetch_first_working(["ACWX", "VEU", "VXUS", "ACWI"], start)
-    hyg = fetch_first_working(["HYG", "JNK"], start)
-    ief = fetch_first_working(["IEF", "GOVT", "IEI"], start)
-    hg = fetch_first_working(["HG=F"], start)
-    gc = fetch_first_working(["GC=F"], start)
-    if hg.empty or gc.empty:
-        # Fallback to ETFs if futures unavailable
-        hg = fetch_first_working(["CPER"], start)
-        gc = fetch_first_working(["GLD"], start)
-    vix = fetch_first_working(["^VIX"], start)
-
-    # Ratios
-    hyg_ief = (hyg / ief).dropna()
-    hg_gc = (hg / gc).dropna()
-
-    cols_g["SPY"] = spy
-    cols_g["ACWX"] = acwx
-    cols_g["HYG/IEF"] = hyg_ief
-    cols_g["HG/GC"] = hg_gc
-    cols_g["VIX_inv"] = vix  # we'll invert via z-score later
-
-    growth_df = safe_align(cols_g, min_required=3)
-
-    # USD block
-    dxy = fetch_first_working(["DX-Y.NYB", "^DXY", "UUP", "USDU"], start)
-
-    eurusd = fetch_first_working(["EURUSD=X", "FXE"], start)
-    usdjpy = fetch_first_working(["JPY=X", "USDJPY=X"], start)  # this is USD/JPY typically; name is confusing on yfinance
-    # yfinance "JPY=X" = USDJPY (units JPY per USD). To get JPYUSD, invert.
-    jpyusd = 1.0 / usdjpy if not usdjpy.empty else pd.Series(dtype=float)
-
-    cols_u: Dict[str, pd.Series] = {
-        "DXY_or_UUP": dxy,
-        "EURUSD_inv": eurusd,  # will invert in z-score stage
-        "JPYUSD_inv": jpyusd,  # will invert in z-score stage (so ends up aligned with USD strength)
-    }
-    usd_df = safe_align(cols_u, min_required=2)
-
-    return growth_df, usd_df
-
-
-# ----------------------------
-# Composite construction
-# ----------------------------
-
-def composite_scores(growth_df: pd.DataFrame,
-                     usd_df: pd.DataFrame,
-                     z_lookback_days: int = 252,
-                     perf_window_days: int = 63,
-                     weights_growth: Dict[str, float] | None = None,
-                     weights_usd: Dict[str, float] | None = None) -> Tuple[pd.Series, pd.Series, pd.DataFrame]:
-    """Compute X (growth) and Y (USD) composite scores.
-    Returns (x_series, y_series, joined_frame)
-    """
-    if weights_growth is None:
-        weights_growth = {c: 1.0 for c in growth_df.columns}
-    if weights_usd is None:
-        weights_usd = {c: 1.0 for c in usd_df.columns}
-
-    # Compute performance windows first (e.g., 3-month returns), then z-score
-    g_feats = {}
-    for c in growth_df.columns:
-        perf = pct_change_period(growth_df[c], perf_window_days)
-        inv = ("VIX" in c)  # invert VIX behaviour
-        g_feats[c] = (-zscore(perf, z_lookback_days) if inv else zscore(perf, z_lookback_days)) * weights_growth.get(c, 1.0)
-
-    u_feats = {}
-    for c in usd_df.columns:
-        perf = pct_change_period(usd_df[c], perf_window_days)
-        inv = ("inv" in c)  # invert the inverses so higher = stronger USD
-        u_feats[c] = (-zscore(perf, z_lookback_days) if inv else zscore(perf, z_lookback_days)) * weights_usd.get(c, 1.0)
-
-    g_mat = pd.concat(g_feats, axis=1)
-    u_mat = pd.concat(u_feats, axis=1)
-
-    # Row-wise weighted means ignoring NaNs
-    wg = pd.Series({c: abs(weights_growth.get(c, 1.0)) for c in g_mat.columns})
-    wu = pd.Series({c: abs(weights_usd.get(c, 1.0)) for c in u_mat.columns})
-
-    denom_g = (~g_mat.isna()).multiply(wg, axis=1).sum(axis=1).replace(0, np.nan)
-    denom_u = (~u_mat.isna()).multiply(wu, axis=1).sum(axis=1).replace(0, np.nan)
-
-    x = g_mat.sum(axis=1) / denom_g
-    y = u_mat.sum(axis=1) / denom_u
-
-    x = x.dropna()
-    y = y.dropna()
-    x, y = x.align(y, join="inner")
-    frame = pd.DataFrame({"GrowthX": x, "USDY": y}).dropna()
-    return x, y, frame
-
-
-def fit_smile_curve(x: pd.Series, y: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
-    """Fit y ~ a*x^2 + b using polyfit and return curve points (xs, ys)."""
-    if len(x) < 30:
-        # not enough data, return simple parabola
-        xs = np.linspace(-2, 2, 200)
-        ys = xs ** 2
-        return xs, ys
-    try:
-        coeffs = np.polyfit(x, y, deg=2)
-        xs = np.linspace(x.min(), x.max(), 400)
-        ys = coeffs[0] * xs ** 2 + coeffs[1] * xs + coeffs[2]
-        return xs, ys
-    except Exception:
-        xs = np.linspace(-2, 2, 200)
-        ys = xs ** 2
-        return xs, ys
-
-
-def classify_regime(x_now: float, y_now: float) -> str:
-    # Simple regime map
-    if x_now <= -0.4 and y_now >= 0.4:
-        return "Crisis USD bid (left tail)"
-    if x_now >= 0.5 and y_now >= 0.3:
-        return "US Exceptionalism (right tail)"
-    if x_now >= 0.2 and y_now <= -0.2:
-        return "Global reflation / USD soft (smile trough)"
-    return "Transitional / Mixed"
-
-
-# ----------------------------
-# Dash app
-# ----------------------------
-
-app = Dash(__name__)
-server = app.server
-app.title = "Interactive Dollar Smile"
-
-app.layout = html.Div([
-    html.H1("Interactive Dollar Smile"),
-    html.Div("Proxies via yfinance. Adjust lookback and windows to taste."),
-    html.Br(),
-
-    html.Div([
-        html.Div([
-            html.Label("Lookback (years)"),
-            dcc.Slider(id="lookback_years", min=2, max=10, step=1, value=6,
-                       marks={i: str(i) for i in range(2, 11)}),
-            html.Br(),
-            html.Label("Performance window (days)"),
-            dcc.Slider(id="perf_days", min=21, max=126, step=7, value=63,
-                       marks={21: "1m", 42: "2m", 63: "3m", 84: "4m", 105: "5m", 126: "6m"}),
-            html.Br(),
-            html.Label("Z-score lookback (days)"),
-            dcc.Slider(id="z_lookback", min=126, max=756, step=21, value=252,
-                       marks={126: "~6m", 252: "~1y", 504: "~2y", 756: "~3y"}),
-        ], style={"flex": 1, "minWidth": 280, "paddingRight": "24px"}),
-
-        html.Div([
-            html.Div(id="regime_box", style={"fontSize": "20px", "marginBottom": "10px", "fontWeight": "600"}),
-            dcc.Graph(id="smile_chart"),
-        ], style={"flex": 3})
-    ], style={"display": "flex", "flexWrap": "wrap"}),
-
-    html.Br(),
-    html.Div([
-        html.Div([
-            html.H3("Growth / Risk Sentiment Composite (X)"),
-            dcc.Graph(id="ts_growth"),
-        ], style={"flex": 1, "minWidth": 360, "paddingRight": "12px"}),
-        html.Div([
-            html.H3("USD Strength Composite (Y)"),
-            dcc.Graph(id="ts_usd"),
-        ], style={"flex": 1, "minWidth": 360, "paddingLeft": "12px"}),
-    ], style={"display": "flex", "flexWrap": "wrap"}),
-
-    html.Br(),
-    html.Details([
-        html.Summary("Data & Methodology"),
-        html.Ul([
-            html.Li("Growth (X): 3m perf z-scores averaged for SPY, ACWX, HYG/IEF, Copper/Gold, and inverted VIX."),
-            html.Li("USD (Y): 3m perf z-scores averaged for DXY/UUP, inverted EURUSD, inverted JPYUSD."),
-            html.Li("Smile curve: quadratic fit over historical X vs Y."),
-            html.Li("Regimes: rule-based bands on current (X, Y)."),
-        ])
-    ])
-])
-
-
-@app.callback(
-    [Output("smile_chart", "figure"),
-     Output("ts_growth", "figure"),
-     Output("ts_usd", "figure"),
-     Output("regime_box", "children")],
-    [Input("lookback_years", "value"),
-     Input("perf_days", "value"),
-     Input("z_lookback", "value")]
+# Page configuration
+st.set_page_config(
+    page_title="Dollar Smile Dashboard",
+    page_icon="📈",
+    layout="wide"
 )
 
-def update(lookback_years: int, perf_days: int, z_lb: int):
-    start = (dt.date.today() - dt.timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
+st.title("📈 Morgan Stanley Dollar Smile Theory Dashboard")
+st.markdown("Visualizing the Dollar Smile theory using live market data")
 
-    growth_df, usd_df = get_market_frame(start)
-    if growth_df.empty or usd_df.empty:
-        msg = "One or more required series failed to download. Try increasing lookback or check tickers."
-        empty_fig = go.Figure().add_annotation(text=msg, showarrow=False, x=0.5, y=0.5)
-        return empty_fig, empty_fig, empty_fig, "Data error"
+# Sidebar for metrics
+st.sidebar.header("Current Metrics")
 
-    x, y, frame = composite_scores(growth_df, usd_df, z_lookback_days=z_lb, perf_window_days=perf_days)
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def fetch_market_data():
+    """Fetch live market data for DXY, SPY, ACWX, and VIX"""
+    try:
+        # Fetch data for the last 90 days to calculate trailing metrics
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=90)
+        
+        # Fetch tickers
+        dxy = yf.download("DX-Y.NYB", start=start_date, end=end_date, progress=False)
+        spy = yf.download("SPY", start=start_date, end=end_date, progress=False)
+        acwx = yf.download("ACWX", start=start_date, end=end_date, progress=False)
+        vix = yf.download("^VIX", start=start_date, end=end_date, progress=False)
+        
+        return {
+            'dxy': dxy,
+            'spy': spy,
+            'acwx': acwx,
+            'vix': vix
+        }
+    except Exception as e:
+        st.error(f"Error fetching data: {str(e)}")
+        return None
 
-    xs, ys = fit_smile_curve(frame["GrowthX"], frame["USDY"])
+def get_latest_value(df, column='Adj Close'):
+    """Get the latest non-null value from a dataframe"""
+    if df.empty:
+        return None
+    if column in df.columns:
+        series = df[column].dropna()
+    else:
+        series = df.dropna()
+    if series.empty:
+        return None
+    return series.iloc[-1]
 
-    # Build scatter with color by time
-    dates = frame.index
-    colors = (dates - dates.min()).days
+def calculate_zscore(series, window=60):
+    """Calculate rolling Z-score"""
+    if len(series) < window:
+        window = len(series)
+    if window < 2:
+        return pd.Series([0] * len(series), index=series.index)
+    
+    rolling_mean = series.rolling(window=window, min_periods=min(10, window//3)).mean()
+    rolling_std = series.rolling(window=window, min_periods=min(10, window//3)).std()
+    
+    # Avoid division by zero
+    rolling_std = rolling_std.replace(0, np.nan)
+    zscore = (series - rolling_mean) / rolling_std
+    return zscore.fillna(0)
 
-    scatter = go.Scatter(
-        x=frame["GrowthX"], y=frame["USDY"], mode="markers",
-        marker=dict(size=6, color=colors, showscale=True, colorbar=dict(title="days")),
-        name="History"
+def calculate_smile_coordinates(dxy_data, spy_data, acwx_data, vix_data):
+    """Calculate X and Y coordinates for the Dollar Smile"""
+    
+    # Get adjusted close prices
+    dxy_close = dxy_data['Adj Close'] if 'Adj Close' in dxy_data.columns else dxy_data.iloc[:, -1]
+    spy_close = spy_data['Adj Close'] if 'Adj Close' in spy_data.columns else spy_data.iloc[:, -1]
+    acwx_close = acwx_data['Adj Close'] if 'Adj Close' in acwx_data.columns else acwx_data.iloc[:, -1]
+    vix_close = vix_data['Adj Close'] if 'Adj Close' in vix_data.columns else vix_data.iloc[:, -1]
+    
+    # Align all series by date
+    aligned = pd.DataFrame({
+        'DXY': dxy_close,
+        'SPY': spy_close,
+        'ACWX': acwx_close,
+        'VIX': vix_close
+    }).dropna()
+    
+    if len(aligned) < 10:
+        return None, None, None
+    
+    # Calculate SPY/ACWX ratio
+    growth_ratio = aligned['SPY'] / aligned['ACWX']
+    
+    # Calculate Z-scores
+    dxy_zscore = calculate_zscore(aligned['DXY'])
+    growth_ratio_zscore = calculate_zscore(growth_ratio)
+    
+    # Calculate X coordinate
+    # If VIX > 25, shift X to negative (Left Side/Fear)
+    x_coords = []
+    for idx, vix_val in enumerate(aligned['VIX']):
+        if pd.notna(vix_val) and vix_val > 25:
+            # Shift to negative (fear side)
+            x_coords.append(-abs(growth_ratio_zscore.iloc[idx]))
+        else:
+            x_coords.append(growth_ratio_zscore.iloc[idx])
+    
+    x_coords = pd.Series(x_coords, index=aligned.index)
+    
+    # Y coordinate is Z-score of DXY
+    y_coords = dxy_zscore
+    
+    # Create result dataframe
+    result_df = pd.DataFrame({
+        'Date': aligned.index,
+        'X': x_coords,
+        'Y': y_coords,
+        'VIX': aligned['VIX'],
+        'DXY': aligned['DXY'],
+        'Growth_Ratio': growth_ratio
+    })
+    
+    return result_df, aligned['VIX'].iloc[-1], aligned['DXY'].iloc[-1], growth_ratio.iloc[-1]
+
+def create_smile_plot(df, current_vix, current_dxy, current_growth_ratio):
+    """Create the Dollar Smile visualization"""
+    
+    if df is None or len(df) < 2:
+        st.error("Insufficient data to create visualization")
+        return None
+    
+    # Get last 60 days for trail
+    df_trail = df.tail(60).copy()
+    current_point = df.iloc[-1]
+    
+    # Create static parabola background (theoretical smile)
+    # Parabola: y = a*x^2 + b, where a > 0 creates a smile
+    x_range = np.linspace(df['X'].min() - 0.5, df['X'].max() + 0.5, 200)
+    # Standard smile: y = x^2 (shifted and scaled to fit data)
+    # Adjust parabola to fit the data range
+    x_center = (df['X'].min() + df['X'].max()) / 2
+    y_min = df['Y'].min()
+    y_max = df['Y'].max()
+    
+    # Create a smile curve: y = a*(x - x_center)^2 + y_offset
+    # Scale to fit the data
+    a = 0.3  # Curvature parameter
+    y_offset = (y_min + y_max) / 2
+    y_smile = a * (x_range - x_center)**2 + y_offset
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add theoretical smile curve (parabola)
+    fig.add_trace(go.Scatter(
+        x=x_range,
+        y=y_smile,
+        mode='lines',
+        name='Theoretical Smile',
+        line=dict(color='gray', width=2, dash='dash'),
+        opacity=0.7
+    ))
+    
+    # Add trail of last 60 days
+    fig.add_trace(go.Scatter(
+        x=df_trail['X'],
+        y=df_trail['Y'],
+        mode='lines+markers',
+        name='60-Day Trail',
+        line=dict(color='blue', width=1),
+        marker=dict(size=4, color='blue', opacity=0.6),
+        hovertemplate='Date: %{text}<br>X: %{x:.3f}<br>Y: %{y:.3f}<extra></extra>',
+        text=df_trail['Date'].dt.strftime('%Y-%m-%d')
+    ))
+    
+    # Add current position (highlighted)
+    fig.add_trace(go.Scatter(
+        x=[current_point['X']],
+        y=[current_point['Y']],
+        mode='markers+text',
+        name='Current Position',
+        marker=dict(size=20, color='red', symbol='diamond'),
+        text=['Current'],
+        textposition='top center',
+        hovertemplate=f'Date: {current_point["Date"].strftime("%Y-%m-%d")}<br>X: {current_point["X"]:.3f}<br>Y: {current_point["Y"]:.3f}<br>VIX: {current_point["VIX"]:.2f}<br>DXY: {current_point["DXY"]:.2f}<extra></extra>'
+    ))
+    
+    # Update layout
+    fig.update_layout(
+        title='Dollar Smile Visualization',
+        xaxis_title='Smile X-Coordinate (Growth/Risk Sentiment)',
+        yaxis_title='Smile Y-Coordinate (USD Strength - DXY Z-score)',
+        hovermode='closest',
+        template='plotly_white',
+        height=600,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        )
     )
+    
+    # Add grid
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    
+    # Add zero lines
+    fig.add_hline(y=0, line_dash="dot", line_color="black", opacity=0.3)
+    fig.add_vline(x=0, line_dash="dot", line_color="black", opacity=0.3)
+    
+    return fig
 
-    curve = go.Scatter(x=xs, y=ys, mode="lines", name="Fitted smile (quad)")
+# Main app logic
+data = fetch_market_data()
 
-    # Today's point
-    x_now = frame["GrowthX"].iloc[-1]
-    y_now = frame["USDY"].iloc[-1]
-    today_pt = go.Scatter(x=[x_now], y=[y_now], mode="markers+text",
-                          marker=dict(size=14, symbol="diamond"),
-                          text=["Today"], textposition="top center",
-                          name="Today")
-
-    fig_smile = go.Figure(data=[scatter, curve, today_pt])
-    fig_smile.update_layout(
-        xaxis_title="Growth / Risk Sentiment (X)",
-        yaxis_title="USD Strength (Y)",
-        title="Dollar Smile: composites vs fitted curve",
-        template="plotly_white",
-        hovermode="closest"
+if data is not None:
+    # Calculate coordinates
+    result_df, current_vix, current_dxy, current_growth_ratio = calculate_smile_coordinates(
+        data['dxy'], data['spy'], data['acwx'], data['vix']
     )
+    
+    if result_df is not None:
+        # Display metrics in sidebar
+        st.sidebar.metric("VIX", f"{current_vix:.2f}")
+        st.sidebar.metric("USD Level (DXY)", f"{current_dxy:.2f}")
+        st.sidebar.metric("Growth Ratio (SPY/ACWX)", f"{current_growth_ratio:.4f}")
+        
+        # Display current coordinates
+        current_x = result_df.iloc[-1]['X']
+        current_y = result_df.iloc[-1]['Y']
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Current Position")
+        st.sidebar.metric("X-Coordinate", f"{current_x:.3f}")
+        st.sidebar.metric("Y-Coordinate", f"{current_y:.3f}")
+        
+        # Determine regime
+        if current_vix > 25:
+            regime = "Left Side (Fear)"
+            st.sidebar.warning(f"⚠️ {regime}")
+        elif current_x > 0.5 and current_y > 0.3:
+            regime = "Right Side (US Exceptionalism)"
+            st.sidebar.success(f"✅ {regime}")
+        elif current_x < -0.2 and current_y > 0.3:
+            regime = "Left Side (Crisis USD Bid)"
+            st.sidebar.error(f"🔴 {regime}")
+        else:
+            regime = "Transitional/Mixed"
+            st.sidebar.info(f"ℹ️ {regime}")
+        
+        # Create and display plot
+        fig = create_smile_plot(result_df, current_vix, current_dxy, current_growth_ratio)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Display data table (optional, collapsible)
+        with st.expander("View Historical Data"):
+            st.dataframe(
+                result_df[['Date', 'X', 'Y', 'VIX', 'DXY', 'Growth_Ratio']].tail(30),
+                use_container_width=True
+            )
+    else:
+        st.error("Could not calculate coordinates. Please check data availability.")
+else:
+    st.error("Failed to fetch market data. Please try again later.")
 
-    # Time series
-    ts_g = go.Figure(data=[go.Scatter(x=frame.index, y=frame["GrowthX"], mode="lines", name="GrowthX")])
-    ts_g.add_hline(y=0, line=dict(dash="dot"))
-    ts_g.update_layout(title="Growth / Risk Sentiment (X)", template="plotly_white")
-
-    ts_u = go.Figure(data=[go.Scatter(x=frame.index, y=frame["USDY"], mode="lines", name="USDY")])
-    ts_u.add_hline(y=0, line=dict(dash="dot"))
-    ts_u.update_layout(title="USD Strength (Y)", template="plotly_white")
-
-    regime = classify_regime(x_now, y_now)
-    regime_text = f"Current regime: {regime} — X={x_now:.2f}, Y={y_now:.2f}"
-
-    return fig_smile, ts_g, ts_u, regime_text
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8050"))
-    host = os.getenv("HOST", "0.0.0.0")
-    app.run(debug=True, host=host, port=port)
-
+# Footer
+st.markdown("---")
+st.markdown("**Data Source:** Yahoo Finance via yfinance | **Last Updated:** " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
